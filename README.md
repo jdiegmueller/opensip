@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/opensip)](https://pypi.org/project/opensip/)
 [![Python](https://img.shields.io/pypi/pyversions/opensip)](https://pypi.org/project/opensip/)
-[![License](https://img.shields.io/pypi/l/opensip)](https://github.com/artan/opensip/blob/main/LICENSE)
+[![License](https://img.shields.io/pypi/l/opensip)](https://github.com/artanergin44-collab/opensip/blob/main/LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange)](#bilinen-s%C4%B1n%C4%B1rlamalar)
 
 **Saf-Python, asyncio tabanlı SIP/RTP user-agent kütüphanesi.** UAC + UAS, REGISTER, HTTP Digest auth, G.711 ses kodek'i, opsiyonel mikrofon/hoparlör köprüsü — sıfır C bağımlılığı, ~33 KB wheel.
@@ -191,14 +191,15 @@ opensip/
 
 ## Bilinen sınırlamalar
 
-`opensip` v0.1 minimal-viable bir UA: gerçek bir provider ile çağrı yapar ama RFC 3261'in birkaç önemli parçası **henüz yok**. Telefon altyapısı kurmadan önce farkında olun.
+`opensip` hâlâ erken alfa bir UA: gerçek bir provider ile çağrı yapar ama RFC 3261'in birkaç önemli parçası **henüz yok**. Telefon altyapısı kurmadan önce farkında olun.
 
 - **Transaction katmanı yok** (RFC 3261 §17). UDP retransmission timer'ları (Timer A–K) yok — paket düşerse istek timeout'a düşer. LAN / kayıpsız ağda fark edilmez; internet üzerinden kaybedilen ilk INVITE'ı tekrar göndermez.
 - **Dialog state machine sınırlı.** Re-INVITE (hold/resume), UPDATE, target refresh çalışmaz; route set INVITE/BYE/ACK'te kullanılmaz — uzun proxy zincirleri kırılır.
 - **NAT handling client-side yok.** SDP `c=` satırına LAN IP yazılır; iki yönlü RTP yalnızca provider symmetric-RTP / SBC NAT handling yapıyorsa çalışır (netsantral yapıyor, çoğu yapmaz). rport/received Contact'a yansıtılmaz, STUN/ICE yok.
 - **Yalnızca UDP.** TCP ve TLS yok; TLS-only provider'lar (bazı Twilio konfigürasyonları) için kullanılamaz.
-- **RTCP yok.** Jitter buffer yok — gelen RTP doğrudan callback'e gönderilir, out-of-order paket / sıralama boşluğu metrikleri yok.
-- **DTMF yok.** RFC 2833 payload type 101 alınır ama sessizce düşürülür.
+- **RTCP yok.** RTP istatistikleri ve jitter ölçümü var, ancak SR/RR paketleri ve RTCP tabanlı raporlama henüz yok.
+- **Jitter buffer adaptif değil.** Sabit hedef derinlikle reorder + gap-fill yapar; otomatik retune / drift management henüz yok.
+- **DTMF kapsamı sınırlı.** RFC 4733 giriş/çıkış temel akışı var, ancak SIP INFO veya daha gelişmiş interop senaryoları henüz yok.
 - **Codec sınırlı.** PCMU + PCMA + telephone-event (gönderme yok). Opus / G.722 / G.729 yok.
 - **Authorization re-use yok.** Her INVITE/BYE'da yeniden challenge — küçük gecikme katar.
 
@@ -224,12 +225,12 @@ opensip "küçük, Python-native, hack'lemesi kolay" yönünde bir niş tutuyor.
 - **Faz 2 — özellik:** TLS + SRTP, ICE-lite (RFC 8445), Opus + G.722, MESSAGE/SUBSCRIBE/NOTIFY/REFER, re-INVITE/hold, video iskeleti
 - **Faz 3 — test + perf:** Docker'da Asterisk/Kamailio/FreeSWITCH entegrasyon testleri, parser fuzzing (hypothesis), zero-copy parsing
 
-Detaylı önceliklendirme ve durum: [issue tracker](https://github.com/artan/opensip/issues).
+Detaylı önceliklendirme ve durum: [issue tracker](https://github.com/artanergin44-collab/opensip/issues).
 
 ## Geliştirme
 
 ```bash
-git clone https://github.com/artan/opensip.git
+git clone https://github.com/artanergin44-collab/opensip.git
 cd opensip
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev,audio]"

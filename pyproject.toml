@@ -35,8 +35,8 @@ audio = ["sounddevice>=0.4.6", "numpy>=1.24"]
 dev = ["pytest>=7", "pytest-asyncio>=0.23", "ruff>=0.4"]
 
 [project.urls]
-Homepage = "https://github.com/artan/opensip"
-Issues = "https://github.com/artan/opensip/issues"
+Homepage = "https://github.com/artanergin44-collab/opensip"
+Issues = "https://github.com/artanergin44-collab/opensip/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opensip"]
