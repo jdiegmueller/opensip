@@ -120,10 +120,20 @@ from opensip import UserAgent, Account, Call
 | Yöntem | Açıklama |
 |---|---|
 | `await ua.start()` / `stop()` | Transport'u aç / kapat |
-| `await ua.register(acc)` | REGISTER + otomatik yenileme |
+| `await ua.register(acc)` | REGISTER + otomatik yenileme (registrar'ın verdiği expiry'ye göre) |
 | `await ua.unregister(acc)` | `Expires: 0` REGISTER |
 | `await ua.invite(acc, target)` → `Call` | Giden çağrı kur |
 | `@ua.on_incoming_call` | Gelen INVITE handler decorator |
+| `@ua.on_registration_state` | Kayıt durumu geçişleri için callback (sync veya async) |
+| `acc.registration_state` | Anlık kayıt durumu: `unregistered / registered / degraded / lapsed` |
+| `UserAgent(timers=TimerConfig(...))` | Non-INVITE transaction timer'larını (T1/T2/Timer F) özelleştir |
+
+> **Transaction davranışı:** REGISTER ve BYE, RFC 3261 §17.1.2 non-INVITE client
+> transaction'ları üzerinden gönderilir — kayıp UDP paketleri Timer E ile yeniden
+> iletilir. Final yanıt hiç gelmezse `asyncio.TimeoutError` **değil**,
+> `TransactionTimeout` (bir `TransactionError` alt sınıfı, top-level export) yükselir.
+> Kayıt registrar tarafından reddedilirse (`expires=0`) `RegistrationError` yükselir;
+> kayıt süresi dolmuşsa yenileme, jitter'lı üstel geri çekilme (2s → 60s) ile sürer.
 
 **`Call`** — bir SIP dialog'u
 | Yöntem / property | Açıklama |
@@ -193,7 +203,7 @@ opensip/
 
 `opensip` hâlâ erken alfa bir UA: gerçek bir provider ile çağrı yapar ama RFC 3261'in birkaç önemli parçası **henüz yok**. Telefon altyapısı kurmadan önce farkında olun.
 
-- **Transaction katmanı yok** (RFC 3261 §17). UDP retransmission timer'ları (Timer A–K) yok — paket düşerse istek timeout'a düşer. LAN / kayıpsız ağda fark edilmez; internet üzerinden kaybedilen ilk INVITE'ı tekrar göndermez.
+- **Transaction katmanı kısmi** (RFC 3261 §17). Non-INVITE istekler (REGISTER/BYE) Timer E/F/K ile tam client transaction üzerinden gider; **INVITE client/server transaction'ları henüz yok** — internet üzerinden kaybedilen ilk INVITE yeniden gönderilmez.
 - **Dialog state machine sınırlı.** Re-INVITE (hold/resume), UPDATE, target refresh çalışmaz; route set INVITE/BYE/ACK'te kullanılmaz — uzun proxy zincirleri kırılır.
 - **NAT handling client-side yok.** SDP `c=` satırına LAN IP yazılır; iki yönlü RTP yalnızca provider symmetric-RTP / SBC NAT handling yapıyorsa çalışır (netsantral yapıyor, çoğu yapmaz). rport/received Contact'a yansıtılmaz, STUN/ICE yok.
 - **Yalnızca UDP.** TCP ve TLS yok; TLS-only provider'lar (bazı Twilio konfigürasyonları) için kullanılamaz.
@@ -210,7 +220,7 @@ opensip/
 | Dil | Pure Python | Pure Python | C | C/C++ |
 | asyncio | ✅ | ✅ | ❌ | ❌ |
 | Mic/speaker bridge | ✅ | ❌ | ✅ | ✅ |
-| Transaction layer | ❌ (roadmap) | ❌ | ✅ | ✅ |
+| Transaction layer | 🟡 non-INVITE | ❌ | ✅ | ✅ |
 | NAT (ICE/STUN) | ❌ (roadmap) | ❌ | ✅ | ✅ |
 | TLS / SRTP | ❌ (roadmap) | ❌ | ✅ | ✅ |
 | Video | ❌ | ❌ | ✅ | ✅ |
@@ -221,7 +231,7 @@ opensip "küçük, Python-native, hack'lemesi kolay" yönünde bir niş tutuyor.
 
 ## Yol haritası
 
-- **Faz 1 — sağlamlaştırma:** transaction katmanı (RFC 3261 §17), tam dialog state machine, rport/received NAT, TCP transport, RTCP SR/RR, jitter buffer, DTMF (RFC 2833 in/out)
+- **Faz 1 — sağlamlaştırma:** INVITE transaction'ları (RFC 3261 §17 kalan kısmı), tam dialog state machine, rport/received NAT, TCP transport, RTCP SR/RR, jitter buffer, DTMF (RFC 2833 in/out)
 - **Faz 2 — özellik:** TLS + SRTP, ICE-lite (RFC 8445), Opus + G.722, MESSAGE/SUBSCRIBE/NOTIFY/REFER, re-INVITE/hold, video iskeleti
 - **Faz 3 — test + perf:** Docker'da Asterisk/Kamailio/FreeSWITCH entegrasyon testleri, parser fuzzing (hypothesis), zero-copy parsing
 

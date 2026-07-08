@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -41,6 +42,7 @@ from .headers import NameAddr, URI, Via, _split_top_level
 from .message import Headers, SIPRequest, SIPResponse
 from .rtp import DTMF_DEFAULT_PT, RTPSession, pick_rtp_port_pair
 from .sdp import Codec, SDPSession, make_audio_offer, pick_common_codec
+from .transaction import TimerConfig, TransactionManager
 from .transport import UDPTransport
 from .utils import guess_local_ip, new_branch, new_call_id, new_tag
 
@@ -49,6 +51,13 @@ log = logging.getLogger("opensip.ua")
 USER_AGENT = "opensip/0.2.1"
 DEFAULT_REGISTER_EXPIRES = 600
 DEFAULT_INVITE_TIMEOUT = 32.0
+
+# Observable registration health, reported via UserAgent.on_registration_state:
+#   unregistered — the UA is not maintaining a registration
+#   registered   — last REGISTER/refresh succeeded
+#   degraded     — a refresh failed but the binding should still be valid
+#   lapsed       — refreshes keep failing past the granted expiry
+REGISTRATION_STATES = ("unregistered", "registered", "degraded", "lapsed")
 
 
 def _dtmf_pt_from_sdp(sdp: SDPSession | None, default: int = DTMF_DEFAULT_PT) -> int:
@@ -77,6 +86,7 @@ class Account:
     # maintaining a registration"), not a reflection of the registrar's
     # binding: it can stay True after the binding lapses (failed refreshes)
     # and become False while a binding still exists (failed unregister).
+    # The observable health status lives in registration_state.
     _registered: bool = field(default=False, init=False, repr=False)
     _register_task: asyncio.Task | None = field(default=None, init=False, repr=False)
     # REGISTER sequencing (RFC 3261 §10.2): one Call-ID per account per boot
@@ -89,6 +99,14 @@ class Account:
     # §10.3 step 6), so overlapping sends must not interleave.
     _register_lock: asyncio.Lock = field(default_factory=asyncio.Lock,
                                          init=False, repr=False)
+    _registration_state: str = field(default="unregistered", init=False, repr=False)
+
+    @property
+    def registration_state(self) -> str:
+        """Registration health, one of REGISTRATION_STATES. Like
+        ``_registered``, this reflects what the UA is doing/observing,
+        not verified registrar truth."""
+        return self._registration_state
 
     def __post_init__(self) -> None:
         if not self.server[0]:
@@ -104,13 +122,16 @@ class Account:
 # REGISTER helpers
 # ---------------------------------------------------------------------------
 
-# Testability seams: the refresh loop sleeps and reads the clock through
-# these so tests can monkeypatch opensip.ua._sleep / opensip.ua._monotonic
-# without patching asyncio or time globally. time.monotonic does not advance
-# across system suspend on Linux, so lapse detection across suspend/resume
-# is out of scope.
+# Testability seams: the refresh loop sleeps, reads the clock, and draws
+# jitter through these so tests can monkeypatch opensip.ua._sleep /
+# _monotonic / _random without patching stdlib modules globally. (NOTE:
+# opensip.transaction has its own _sleep/_monotonic seams — patch the module
+# that owns the code under test.) time.monotonic does not advance across
+# system suspend on Linux, so lapse detection across suspend/resume is out
+# of scope.
 _sleep = asyncio.sleep
 _monotonic = time.monotonic
+_random = random.random
 
 
 @dataclass(frozen=True)
@@ -255,11 +276,27 @@ def _refresh_delay(granted_expires: int) -> float:
 
 def _refresh_failure_delay(remaining_expires: float) -> float:
     # Retry within half the remaining validity, clamped to [0.25, 30].
-    # Once the deadline has passed there is no urgency gradient left —
-    # poll at a fixed rate instead of hammering the registrar.
-    if remaining_expires <= 0:
-        return 5.0
+    # Only meaningful while the binding is still valid; once the deadline
+    # has passed, _lapsed_backoff_delay applies instead.
     return max(0.25, min(30.0, remaining_expires * 0.5))
+
+
+_LAPSED_BACKOFF_BASE = 2.0
+_LAPSED_BACKOFF_CAP = 60.0
+
+
+def _log_callback_exception(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        log.error("registration-state callback raised",
+                  exc_info=task.exception())
+
+
+def _lapsed_backoff_delay(failures: int) -> float:
+    """Backoff once the binding has lapsed: 2, 4, 8, ... capped at 60s,
+    with +/-25% jitter so a fleet of clients doesn't retry in lockstep.
+    Never gives up; ``failures`` counts consecutive post-lapse failures."""
+    base = min(_LAPSED_BACKOFF_CAP, _LAPSED_BACKOFF_BASE * 2.0 ** min(failures, 32))
+    return base * (0.75 + 0.5 * _random())
 
 
 # ---------------------------------------------------------------------------
@@ -371,17 +408,22 @@ class UserAgent:
         local_addr: tuple[str, int] = ("0.0.0.0", 5060),
         user_agent: str = USER_AGENT,
         rtp_port_range: tuple[int, int] = (16384, 32767),
+        timers: TimerConfig | None = None,
     ):
         self.transport = UDPTransport(local_addr=local_addr)
         self.user_agent_header = user_agent
         self.rtp_port_range = rtp_port_range
 
         self._calls: dict[str, Call] = {}             # call-id -> Call
-        self._pending_responses: dict[tuple[str, int], asyncio.Future] = {}
-        # ↑ keyed by (call-id, cseq) for non-INVITE; INVITEs use Call._pending_invite_response
+        # Non-INVITE requests run through client transactions (retransmission
+        # + Timer F); INVITEs use Call._pending_invite_response.
+        self._transactions = TransactionManager(self.transport.send,
+                                                timers or TimerConfig())
 
         self._accounts: list[Account] = []
         self._incoming_call_cb: Callable[[Call], Awaitable[None]] | None = None
+        self._registration_state_cb: (
+            Callable[[Account, str], Awaitable[None] | None] | None) = None
         self._stopped = False
 
         self.transport.set_handler(self._on_message)
@@ -396,11 +438,23 @@ class UserAgent:
 
     async def stop(self) -> None:
         self._stopped = True
+        for account in self._accounts:
+            if account._register_task:
+                account._register_task.cancel()
+                account._register_task = None
+            # The UA is no longer maintaining any binding: mirror
+            # _registered semantics (local maintenance state, not registrar
+            # truth — the binding may still exist server-side).
+            account._registered = False
+            self._set_registration_state(account, "unregistered")
         for call in list(self._calls.values()):
             try:
                 await self._hangup_call(call)
             except Exception:
                 pass
+        # Hangup BYEs have completed (or timed out) above; fail any
+        # still-pending transactions so their awaiters unblock promptly.
+        self._transactions.terminate_all()
         await self.transport.stop()
 
     # ------------------------------------------------------------------
@@ -410,6 +464,36 @@ class UserAgent:
         """Decorator/setter for the incoming-INVITE handler."""
         self._incoming_call_cb = cb
         return cb
+
+    def on_registration_state(
+        self, cb: Callable[[Account, str], Awaitable[None] | None]
+    ) -> Callable[[Account, str], Awaitable[None] | None]:
+        """Decorator/setter for registration-state transitions.
+
+        Called as ``cb(account, state)`` with state in REGISTRATION_STATES,
+        on transitions only (deduplicated). The callback may be sync or
+        async; a coroutine is scheduled as a task, so ordering under load
+        is not guaranteed."""
+        self._registration_state_cb = cb
+        return cb
+
+    def _set_registration_state(self, account: Account, state: str) -> None:
+        if account._registration_state == state:
+            return
+        account._registration_state = state
+        log.debug("registration state for %s: %s", account.aor, state)
+        cb = self._registration_state_cb
+        if cb is None:
+            return
+        # A broken callback must never kill registration maintenance.
+        try:
+            result = cb(account, state)
+        except Exception:
+            log.exception("registration-state callback raised")
+            return
+        if asyncio.iscoroutine(result):
+            task = asyncio.create_task(result)
+            task.add_done_callback(_log_callback_exception)
 
     async def register(self, account: Account, *, expires: int | None = None) -> None:
         """Send REGISTER (with digest re-auth on 401/407 and a single
@@ -432,6 +516,7 @@ class UserAgent:
             self._accounts.append(account)
         result = await self._send_register(account, expires)
         account._registered = True
+        self._set_registration_state(account, "registered")
         if account._register_task:
             account._register_task.cancel()
         account._register_task = asyncio.create_task(
@@ -445,7 +530,10 @@ class UserAgent:
         try:
             await self._send_register(account, 0)
         finally:
+            # Mirrors _registered semantics: the UA has stopped maintaining
+            # the binding even if the unregister request itself failed.
             account._registered = False
+            self._set_registration_state(account, "unregistered")
 
     async def invite(self, account: Account, target: str) -> Call:
         """Place an outgoing call. Returns once the dialog is set up enough to
@@ -486,11 +574,9 @@ class UserAgent:
                 call._pending_invite_response.set_result(resp)
             return
 
-        fut = self._pending_responses.get((call_id, cseq[0]))
-        if fut and not fut.done():
-            if 100 <= resp.status_code < 200:
-                return
-            fut.set_result(resp)
+        if self._transactions.dispatch_response(resp):
+            return
+        log.debug("unmatched response %d %s dropped", resp.status_code, resp.reason)
 
     def _dispatch_request(self, req: SIPRequest, source: tuple[str, int]) -> None:
         method = req.method
@@ -642,6 +728,7 @@ class UserAgent:
             requested = result.requested_expires
             granted = result.granted_expires
             deadline = result.deadline
+            lapsed_failures = 0
             await _sleep(_refresh_delay(granted))
             while not self._stopped and account._registered:
                 try:
@@ -649,12 +736,19 @@ class UserAgent:
                 except Exception as e:
                     remaining = deadline - _monotonic()
                     if remaining <= 0:
-                        log.warning("re-REGISTER failed: %s "
-                                    "(binding may have lapsed)", e)
+                        delay = _lapsed_backoff_delay(lapsed_failures)
+                        lapsed_failures += 1
+                        self._set_registration_state(account, "lapsed")
+                        log.warning("re-REGISTER failed: %s (binding may have "
+                                    "lapsed; retry in %.1fs)", e, delay)
                     else:
+                        delay = _refresh_failure_delay(remaining)
+                        self._set_registration_state(account, "degraded")
                         log.warning("re-REGISTER failed: %s", e)
-                    await _sleep(_refresh_failure_delay(remaining))
+                    await _sleep(delay)
                     continue
+                lapsed_failures = 0
+                self._set_registration_state(account, "registered")
                 requested = result.requested_expires
                 granted = result.granted_expires
                 deadline = result.deadline
@@ -869,7 +963,8 @@ class UserAgent:
                     uri=str(call.remote_target or call.remote_uri),
                     account=account)
                 await do_send(auth)
-        except asyncio.TimeoutError:
+        except TransactionError:
+            # BYE is best-effort: Timer F timeout or UA shutdown mid-flight.
             pass
 
     async def _hangup_call(self, call: Call) -> None:
@@ -1097,16 +1192,13 @@ class UserAgent:
 
     async def _send_and_wait(self, req: SIPRequest, dest: tuple[str, int],
                              call_id: str, cseq_num: int,
-                             timeout: float = 32.0) -> SIPResponse:
-        key = (call_id, cseq_num)
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending_responses[key] = fut
-        try:
-            await self.transport.send(req.encode(), dest)
-            return await asyncio.wait_for(fut, timeout=timeout)
-        finally:
-            self._pending_responses.pop(key, None)
+                             timeout: float | None = None) -> SIPResponse:
+        """Send a non-INVITE request through a client transaction and await
+        the final response. ``timeout`` overrides Timer F (None = config
+        default of 64*T1). call_id/cseq_num are retained for signature
+        compatibility and logging."""
+        log.debug("→ %s %s CSeq %d", req.method, call_id, cseq_num)
+        return await self._transactions.send_request(req, dest, timer_f=timeout)
 
     def _build_auth_header_from_response(
         self,

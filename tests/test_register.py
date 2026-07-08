@@ -19,6 +19,7 @@ from opensip.ua import (
     Account,
     UserAgent,
     _granted_expires,
+    _lapsed_backoff_delay,
     _refresh_delay,
     _refresh_failure_delay,
     _RegisterResult,
@@ -254,8 +255,24 @@ def test_refresh_failure_delay_clamps():
     assert _refresh_failure_delay(360) == 30.0
     assert _refresh_failure_delay(1.0) == 0.5
     assert _refresh_failure_delay(0.4) == 0.25
-    assert _refresh_failure_delay(0.0) == 5.0
-    assert _refresh_failure_delay(-5.0) == 5.0
+
+
+def test_lapsed_backoff_progression(monkeypatch):
+    monkeypatch.setattr(ua_mod, "_random", lambda: 0.5)  # jitter factor 1.0
+    assert [_lapsed_backoff_delay(n) for n in range(7)] == [
+        2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+
+
+def test_lapsed_backoff_jitter_bounds(monkeypatch):
+    monkeypatch.setattr(ua_mod, "_random", lambda: 0.0)
+    assert _lapsed_backoff_delay(0) == 1.5     # 2.0 * 0.75
+    monkeypatch.setattr(ua_mod, "_random", lambda: 1.0)
+    assert _lapsed_backoff_delay(0) == 2.5     # 2.0 * 1.25
+
+
+def test_lapsed_backoff_huge_failure_count_clamped(monkeypatch):
+    monkeypatch.setattr(ua_mod, "_random", lambda: 0.5)
+    assert _lapsed_backoff_delay(10_000) == 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -534,16 +551,34 @@ async def test_tiny_grant_failure_retry_beats_deadline(monkeypatch):
     assert sum(recorded) < 2.0
 
 
-async def test_post_lapse_fixed_rate_and_warning(monkeypatch, caplog):
+async def test_post_lapse_backoff_and_warning(monkeypatch, caplog):
     ua, account, script = _make_ua(
-        RuntimeError("down"), RuntimeError("down"), RuntimeError("down"))
+        RuntimeError("down"), RuntimeError("down"),
+        RuntimeError("down"), RuntimeError("down"))
     account._registered = True
+    monkeypatch.setattr(ua_mod, "_random", lambda: 0.5)  # jitter factor 1.0
     recorded: list[float] = []
-    _install_loop_fakes(monkeypatch, _Clock(), recorded, stop_after=4)
+    _install_loop_fakes(monkeypatch, _Clock(), recorded, stop_after=5)
     with caplog.at_level(logging.WARNING, logger="opensip.ua"):
         await ua._reregister_loop(account, _loop_result(requested=1, granted=1))
-    assert recorded == [0.5, 0.25, 0.25, 5.0]
+    # Two pre-deadline retries, then exponential backoff once lapsed.
+    assert recorded == [0.5, 0.25, 0.25, 2.0, 4.0]
     assert "may have lapsed" in caplog.text
+
+
+async def test_lapsed_backoff_resets_after_successful_refresh(monkeypatch):
+    fail = RuntimeError("down")
+    ua, account, script = _make_ua(
+        fail, fail, fail, fail,          # -> lapsed backoff 2.0, 4.0
+        _ok(1),                          # recovery resets the counter
+        fail, fail, fail,                # -> lapsed again: starts back at 2.0
+    )
+    account._registered = True
+    monkeypatch.setattr(ua_mod, "_random", lambda: 0.5)
+    recorded: list[float] = []
+    _install_loop_fakes(monkeypatch, _Clock(), recorded, stop_after=9)
+    await ua._reregister_loop(account, _loop_result(requested=1, granted=1))
+    assert recorded == [0.5, 0.25, 0.25, 2.0, 4.0, 0.5, 0.25, 0.25, 2.0]
 
 
 async def test_refresh_requests_raised_expiry_after_423(monkeypatch):
@@ -601,3 +636,78 @@ async def test_loop_deadline_tracks_send_time_across_rtt(monkeypatch):
     # It fails at t=1370, so remaining = 10 → failure delay 5.0.
     # A response-time deadline (1390) would leave remaining 20 → delay 10.0.
     assert recorded == [180.0, 180.0, 5.0]
+
+
+# ---------------------------------------------------------------------------
+# Registration-state callback
+# ---------------------------------------------------------------------------
+
+async def test_registration_state_lifecycle_and_dedup(monkeypatch):
+    fail = RuntimeError("down")
+    ua, account, script = _make_ua(_ok(1), fail, fail, fail, _ok(1), _ok())
+    events: list[str] = []
+
+    @ua.on_registration_state
+    def cb(acc, state):
+        assert acc is account
+        events.append(state)
+
+    assert account.registration_state == "unregistered"
+    await ua.register(account, expires=1)
+    await _drop_refresh_task(account)
+    assert account.registration_state == "registered"
+
+    monkeypatch.setattr(ua_mod, "_random", lambda: 0.5)
+    recorded: list[float] = []
+    _install_loop_fakes(monkeypatch, _Clock(), recorded, stop_after=5)
+    # fail (degraded), fail (degraded — deduplicated), fail (lapsed),
+    # success (registered), then cancelled at the next refresh sleep.
+    await ua._reregister_loop(account, _loop_result(requested=1, granted=1))
+
+    await ua.unregister(account)
+    assert events == ["registered", "degraded", "lapsed", "registered",
+                      "unregistered"]
+    assert account.registration_state == "unregistered"
+
+
+async def test_registration_state_async_callback():
+    ua, account, script = _make_ua(_ok())
+    events: list[str] = []
+
+    @ua.on_registration_state
+    async def cb(acc, state):
+        events.append(state)
+
+    await ua.register(account)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert events == ["registered"]
+    await _drop_refresh_task(account)
+
+
+async def test_raising_state_callback_does_not_kill_loop(monkeypatch, caplog):
+    ua, account, script = _make_ua(RuntimeError("down"), _ok(600))
+
+    @ua.on_registration_state
+    def cb(acc, state):
+        raise ValueError("observer boom")
+
+    account._registered = True
+    recorded: list[float] = []
+    _install_loop_fakes(monkeypatch, _Clock(), recorded, stop_after=3)
+    with caplog.at_level(logging.ERROR, logger="opensip.ua"):
+        await ua._reregister_loop(account, _loop_result(requested=600, granted=600))
+    # Loop kept its normal schedule despite the raising callback.
+    assert recorded == [540.0, 30.0, 540.0]
+    assert "callback raised" in caplog.text
+
+
+async def test_failed_unregister_still_fires_unregistered():
+    ua, account, script = _make_ua(_ok(), RuntimeError("network down"))
+    events: list[str] = []
+    ua.on_registration_state(lambda acc, state: events.append(state))
+    await ua.register(account)
+    with pytest.raises(RuntimeError):
+        await ua.unregister(account)
+    assert events == ["registered", "unregistered"]
+    assert account.registration_state == "unregistered"
