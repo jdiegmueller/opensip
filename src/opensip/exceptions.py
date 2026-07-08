@@ -19,6 +19,16 @@ class AuthenticationError(OpenSIPError):
     """Digest authentication failed."""
 
 
+class RegistrationError(OpenSIPError):
+    """The registrar affirmatively refused the registration.
+
+    Raised only for an explicit ``expires=0`` grant on a non-unregister
+    REGISTER (matching Contact binding or response Expires header), i.e. the
+    registrar granted a zero-length binding. Absent/malformed grants are
+    tolerated (fall-through), not raised.
+    """
+
+
 class TransportError(OpenSIPError):
     """Transport / network error."""
 

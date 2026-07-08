@@ -25,12 +25,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from .auth import Challenge, build_authorization
-from .exceptions import AuthenticationError, OpenSIPError, TransactionError
-from .headers import NameAddr, URI, Via
+from .exceptions import (
+    AuthenticationError,
+    OpenSIPError,
+    RegistrationError,
+    SIPParseError,
+    TransactionError,
+)
+from .headers import NameAddr, URI, Via, _split_top_level
 from .message import Headers, SIPRequest, SIPResponse
 from .rtp import DTMF_DEFAULT_PT, RTPSession, pick_rtp_port_pair
 from .sdp import Codec, SDPSession, make_audio_offer, pick_common_codec
@@ -66,8 +73,22 @@ class Account:
     transport: str = "UDP"
 
     # ----- runtime state, populated by the UA -----
+    # _registered is local registration-maintenance state ("this UA is
+    # maintaining a registration"), not a reflection of the registrar's
+    # binding: it can stay True after the binding lapses (failed refreshes)
+    # and become False while a binding still exists (failed unregister).
     _registered: bool = field(default=False, init=False, repr=False)
     _register_task: asyncio.Task | None = field(default=None, init=False, repr=False)
+    # REGISTER sequencing (RFC 3261 §10.2): one Call-ID per account per boot
+    # cycle (generated lazily on first REGISTER), CSeq incremented for every
+    # emitted REGISTER.
+    _register_call_id: str | None = field(default=None, init=False, repr=False)
+    _register_cseq: int = field(default=0, init=False, repr=False)
+    # Serializes REGISTER operations (register/unregister/refresh): the
+    # registrar processes same-Call-ID REGISTERs by CSeq order (RFC 3261
+    # §10.3 step 6), so overlapping sends must not interleave.
+    _register_lock: asyncio.Lock = field(default_factory=asyncio.Lock,
+                                         init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.server[0]:
@@ -77,6 +98,168 @@ class Account:
     def aor(self) -> str:
         """Address-of-record (sip:user@domain)."""
         return f"sip:{self.username}@{self.domain}"
+
+
+# ---------------------------------------------------------------------------
+# REGISTER helpers
+# ---------------------------------------------------------------------------
+
+# Testability seams: the refresh loop sleeps and reads the clock through
+# these so tests can monkeypatch opensip.ua._sleep / opensip.ua._monotonic
+# without patching asyncio or time globally. time.monotonic does not advance
+# across system suspend on Linux, so lapse detection across suspend/resume
+# is out of scope.
+_sleep = asyncio.sleep
+_monotonic = time.monotonic
+
+
+@dataclass(frozen=True)
+class _RegisterResult:
+    response: SIPResponse
+    requested_expires: int   # after any 423 Min-Expires escalation
+    granted_expires: int     # derived from the successful response
+    deadline: float          # _monotonic() at the final send + granted_expires
+
+
+def _next_register_cseq(account: Account) -> int:
+    account._register_cseq += 1
+    return account._register_cseq
+
+
+def _usable_expires(value: str | None) -> int | None:
+    """An expiry value is usable only if it parses as a positive integer."""
+    if value is None:
+        return None
+    try:
+        n = int(value.strip())
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def _is_explicit_zero(value: str | None) -> bool:
+    """Whether an expiry value affirmatively grants zero.
+
+    An explicit ``0`` is a registrar denial; absent, non-integer, or negative
+    values are not — they stay tolerant fall-throughs (see _granted_expires).
+    """
+    if value is None:
+        return False
+    try:
+        return int(value.strip()) == 0
+    except ValueError:
+        return False
+
+
+def _contact_matches(a: URI, b: URI) -> bool:
+    """Whether two Contact URIs identify the same binding.
+
+    Compares scheme/user/host/port only; URI parameters are ignored, which
+    is correct only while this client maintains a single parameter-free
+    Contact binding per account (see _local_contact_uri). Revisit if
+    multiple bindings, RFC 5626 outbound, or multiple transports are added.
+    """
+    return (
+        a.scheme.lower() == b.scheme.lower()
+        and a.user == b.user
+        and a.host.lower() == b.host.lower()
+        and (a.port or 5060) == (b.port or 5060)
+    )
+
+
+def _clamp_granted(granted: int, requested: int) -> int:
+    """Clamp a derived grant to the requested interval (RFC 3261 §10.3).
+
+    A registrar may only shorten the requested interval; a grant larger than
+    requested is a buggy registrar or a parse artifact, and trusting it would
+    schedule the refresh past the true expiry.
+    """
+    if granted > requested:
+        log.warning("REGISTER response granted expiry %d > requested %d; "
+                    "clamping to requested (RFC 3261 §10.3)", granted, requested)
+        return requested
+    return granted
+
+
+def _granted_expires(resp: SIPResponse, local_contact: URI, requested: int) -> int:
+    """Derive the registrar-granted expiry from a successful REGISTER response.
+
+    Precedence: the matching Contact binding's expires parameter, then the
+    response-level Expires header, then the requested expiry. A value is
+    usable only if it is a positive integer, and a usable value is clamped to
+    ``requested`` (a registrar may only shorten the interval).
+
+    An affirmative ``expires=0`` (matching Contact binding or Expires header)
+    is a registrar denial and raises RegistrationError — but only when
+    ``requested > 0``. An unregister (``requested == 0``) legitimately gets
+    ``Expires: 0`` back and short-circuits to 0 before any denial logic.
+    Absent, non-integer, or negative values stay tolerant fall-throughs:
+    a registrar behind NAT (or applying received/rport) may echo a rewritten
+    Contact that never matches our local URI, so "no match / can't parse"
+    must not be treated as a denial.
+    """
+    if requested <= 0:
+        # Unregister: Expires: 0 / Contact expires=0 is the expected success.
+        return requested
+
+    match_params: dict[str, str] | None = None
+    for raw in resp.headers.get_all("Contact"):
+        for piece in _split_top_level(raw, ","):
+            piece = piece.strip()
+            if not piece or piece == "*":
+                continue
+            try:
+                contact = NameAddr.parse(piece)
+            except SIPParseError:
+                continue
+            if _contact_matches(contact.uri, local_contact):
+                # Angle-bracket form: header params are on NameAddr.params;
+                # an "expires" inside the brackets is a URI param and must
+                # be ignored. Bare form: the parser flattens the trailing
+                # params (header params per RFC 3261 §20.10) onto URI.params,
+                # so read from there. Contact-specific compensation only —
+                # do not generalize or "fix" NameAddr.parse for this.
+                match_params = contact.params if "<" in piece else contact.uri.params
+                break
+        if match_params is not None:
+            break
+
+    if match_params is not None:
+        raw = match_params.get("expires")
+        expires = _usable_expires(raw)
+        if expires is not None:
+            return _clamp_granted(expires, requested)
+        if _is_explicit_zero(raw):
+            raise RegistrationError(
+                "registrar denied registration: matching Contact granted "
+                "expires=0")
+    log.debug("REGISTER response had no matching usable Contact expires; "
+              "falling back to Expires header")
+    raw = resp.headers.get("Expires")
+    expires = _usable_expires(raw)
+    if expires is not None:
+        return _clamp_granted(expires, requested)
+    if _is_explicit_zero(raw):
+        raise RegistrationError(
+            "registrar denied registration: Expires header granted 0")
+    log.warning("REGISTER response had no usable granted expiry; "
+                "falling back to requested expiry %d", requested)
+    return requested
+
+
+def _refresh_delay(granted_expires: int) -> float:
+    # Refresh at 90% of the granted interval, but always at least
+    # 1 second before expiry, and never sooner than 0.5s from now.
+    return max(0.5, min(granted_expires * 0.9, granted_expires - 1.0))
+
+
+def _refresh_failure_delay(remaining_expires: float) -> float:
+    # Retry within half the remaining validity, clamped to [0.25, 30].
+    # Once the deadline has passed there is no urgency gradient left —
+    # poll at a fixed rate instead of hammering the registrar.
+    if remaining_expires <= 0:
+        return 5.0
+    return max(0.25, min(30.0, remaining_expires * 0.5))
 
 
 # ---------------------------------------------------------------------------
@@ -229,20 +412,31 @@ class UserAgent:
         return cb
 
     async def register(self, account: Account, *, expires: int | None = None) -> None:
-        """Send REGISTER (with digest re-auth on 401/407)."""
+        """Send REGISTER (with digest re-auth on 401/407 and a single
+        423 Min-Expires escalation). On success, auto-refresh is scheduled
+        at 90% of the registrar-granted expiry.
+
+        ``expires=0`` takes unregister semantics: it cancels any running
+        refresh task and removes the binding (delegates to :meth:`unregister`),
+        so a stale loop cannot resurrect it. A negative ``expires`` raises
+        ValueError before anything is sent.
+        """
         if expires is None:
             expires = account.expires
+        if expires < 0:
+            raise ValueError(f"expires must be >= 0, got {expires}")
+        if expires == 0:
+            await self.unregister(account)
+            return
         if account not in self._accounts:
             self._accounts.append(account)
-        await self._send_register(account, expires)
-        if expires > 0:
-            account._registered = True
-            # Schedule auto-refresh at expires/2.
-            if account._register_task:
-                account._register_task.cancel()
-            account._register_task = asyncio.create_task(
-                self._reregister_loop(account, expires)
-            )
+        result = await self._send_register(account, expires)
+        account._registered = True
+        if account._register_task:
+            account._register_task.cancel()
+        account._register_task = asyncio.create_task(
+            self._reregister_loop(account, result)
+        )
 
     async def unregister(self, account: Account) -> None:
         if account._register_task:
@@ -372,51 +566,99 @@ class UserAgent:
     # ------------------------------------------------------------------
     # REGISTER
     # ------------------------------------------------------------------
-    async def _send_register(self, account: Account, expires: int) -> SIPResponse:
-        call_id = new_call_id(self.local_addr[0])
-        cseq = 1
+    async def _send_register(self, account: Account, expires: int) -> _RegisterResult:
+        # One REGISTER operation per account at a time (see _register_lock):
+        # the Call-ID/CSeq stream and the registrar's binding state are both
+        # order-sensitive, so overlapping sends must be serialized.
+        async with account._register_lock:
+            return await self._send_register_locked(account, expires)
+
+    async def _send_register_locked(self, account: Account,
+                                    expires: int) -> _RegisterResult:
+        if account._register_call_id is None:
+            account._register_call_id = new_call_id(self.local_addr[0])
+        call_id = account._register_call_id
         from_addr = NameAddr(display=account.display,
                              uri=URI.parse(account.aor),
                              params={"tag": new_tag()})
         to_addr = NameAddr(uri=URI.parse(account.aor))
         registrar_uri = URI(host=account.domain)
 
-        async def do_send(auth_header: tuple[str, str] | None = None) -> SIPResponse:
-            extra = [("Expires", str(expires)), ("Allow",
+        # Capture time at the last emitted request so the caller can derive
+        # the deadline from send time, not response-arrival time (which lags
+        # by RTT + processing). Auth/423 retries mean this ends up being the
+        # time of the final, successful send.
+        last_send_time = 0.0
+
+        async def do_send(req_expires: int,
+                          auth_header: tuple[str, str] | None = None) -> SIPResponse:
+            nonlocal last_send_time
+            extra = [("Expires", str(req_expires)), ("Allow",
                      "INVITE, ACK, CANCEL, BYE, OPTIONS")]
             if auth_header:
                 extra.append(auth_header)
+            # One CSeq per emitted request (RFC 3261 §10.2).
+            cseq = _next_register_cseq(account)
             req = self._build_request(
                 "REGISTER", registrar_uri,
                 account=account, call_id=call_id, cseq_num=cseq,
                 from_addr=from_addr, to_addr=to_addr,
                 extra_headers=extra,
             )
+            last_send_time = _monotonic()
             return await self._send_and_wait(req, account.server, call_id, cseq)
 
-        resp = await do_send()
-        if resp.status_code in (401, 407):
-            auth = self._build_auth_header_from_response(
-                resp, method="REGISTER", uri=str(registrar_uri),
-                account=account)
-            # SIP requires a new CSeq for the re-tried request.
-            cseq += 1
-            resp = await do_send(auth)
+        async def attempt(req_expires: int) -> SIPResponse:
+            resp = await do_send(req_expires)
+            if resp.status_code in (401, 407):
+                auth = self._build_auth_header_from_response(
+                    resp, method="REGISTER", uri=str(registrar_uri),
+                    account=account)
+                resp = await do_send(req_expires, auth)
+            return resp
+
+        resp = await attempt(expires)
+        if resp.status_code == 423 and expires > 0:
+            # At most one Min-Expires escalation; a 423 on unregister
+            # (expires=0) must not be turned into a re-registration. The
+            # raised value is returned to the refresh loop but never
+            # written back to account.expires.
+            min_expires = _usable_expires(resp.headers.get("Min-Expires"))
+            if min_expires is not None and min_expires > expires:
+                expires = min_expires
+                resp = await attempt(expires)
         if resp.status_code >= 300:
             raise AuthenticationError(
                 f"REGISTER failed: {resp.status_code} {resp.reason}"
             )
-        return resp
+        granted = _granted_expires(resp, self._local_contact_uri(account), expires)
+        return _RegisterResult(response=resp, requested_expires=expires,
+                               granted_expires=granted,
+                               deadline=last_send_time + granted)
 
-    async def _reregister_loop(self, account: Account, expires: int) -> None:
+    async def _reregister_loop(self, account: Account,
+                               result: _RegisterResult) -> None:
         try:
+            requested = result.requested_expires
+            granted = result.granted_expires
+            deadline = result.deadline
+            await _sleep(_refresh_delay(granted))
             while not self._stopped and account._registered:
-                # Refresh at half the expires window, min 30s.
-                await asyncio.sleep(max(30, expires // 2))
                 try:
-                    await self._send_register(account, expires)
+                    result = await self._send_register(account, requested)
                 except Exception as e:
-                    log.warning("re-REGISTER failed: %s", e)
+                    remaining = deadline - _monotonic()
+                    if remaining <= 0:
+                        log.warning("re-REGISTER failed: %s "
+                                    "(binding may have lapsed)", e)
+                    else:
+                        log.warning("re-REGISTER failed: %s", e)
+                    await _sleep(_refresh_failure_delay(remaining))
+                    continue
+                requested = result.requested_expires
+                granted = result.granted_expires
+                deadline = result.deadline
+                await _sleep(_refresh_delay(granted))
         except asyncio.CancelledError:
             pass
 
