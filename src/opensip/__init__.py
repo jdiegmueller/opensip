@@ -5,6 +5,7 @@ from .exceptions import (
     SIPParseError,
     TransactionError,
     AuthenticationError,
+    RegistrationError,
 )
 
 __version__ = "0.2.1"
@@ -15,6 +16,7 @@ __all__ = [
     "SIPParseError",
     "TransactionError",
     "AuthenticationError",
+    "RegistrationError",
     # The following are re-exported lazily as modules are implemented:
     #   UserAgent, Account, Call
 ]
