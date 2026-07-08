@@ -4,6 +4,7 @@ from .exceptions import (
     OpenSIPError,
     SIPParseError,
     TransactionError,
+    TransactionTimeout,
     AuthenticationError,
     RegistrationError,
 )
@@ -15,10 +16,11 @@ __all__ = [
     "OpenSIPError",
     "SIPParseError",
     "TransactionError",
+    "TransactionTimeout",
     "AuthenticationError",
     "RegistrationError",
     # The following are re-exported lazily as modules are implemented:
-    #   UserAgent, Account, Call
+    #   UserAgent, Account, Call, TimerConfig
 ]
 
 
@@ -26,4 +28,7 @@ def __getattr__(name: str):  # PEP 562 lazy attributes
     if name in {"UserAgent", "Account", "Call"}:
         from . import ua
         return getattr(ua, name)
+    if name == "TimerConfig":
+        from . import transaction
+        return transaction.TimerConfig
     raise AttributeError(f"module 'opensip' has no attribute {name!r}")

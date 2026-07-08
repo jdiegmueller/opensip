@@ -15,6 +15,10 @@ class TransactionError(OpenSIPError):
     """Transaction layer error (timeout, unexpected response, ...)."""
 
 
+class TransactionTimeout(TransactionError):
+    """Non-INVITE client transaction expired (Timer F) without a final response."""
+
+
 class AuthenticationError(OpenSIPError):
     """Digest authentication failed."""
 
